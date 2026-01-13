@@ -1,4 +1,5 @@
 import { Transform } from 'node:stream'
+import { clearTimeout } from 'node:timers'
 
 // Topic and partition are required for the stream to work properly
 type MessageWithTopicAndPartition = { topic: string; partition: number }
@@ -28,8 +29,6 @@ export class KafkaMessageBatchStream<
   private readonly currentBatchPerTopicPartition: Record<string, TMessage[]>
   private readonly batchTimeoutPerTopicPartition: Record<string, NodeJS.Timeout | undefined>
 
-  private readonly timeoutProcessingPromises: Map<string, Promise<void>> = new Map()
-
   constructor(
     onBatch: OnMessageBatchCallback<TMessage>,
     options: { batchSize: number; timeoutMilliseconds: number },
@@ -42,53 +41,49 @@ export class KafkaMessageBatchStream<
     this.batchTimeoutPerTopicPartition = {}
   }
 
-  override async _transform(message: TMessage, _encoding: BufferEncoding, callback: () => void) {
-    const key = getTopicPartitionKey(message.topic, message.partition)
+  override async _transform(
+    message: TMessage,
+    _encoding: BufferEncoding,
+    callback: (error?: Error | null | undefined) => void,
+  ) {
+    try {
+      const key = getTopicPartitionKey(message.topic, message.partition)
 
-    // Wait for all pending timeout flushes to complete to maintain backpressure
-    if (this.timeoutProcessingPromises.size > 0) {
-      // Capture a snapshot of current promises to avoid race conditions with new timeouts
-      const promiseEntries = Array.from(this.timeoutProcessingPromises.entries())
-      // Wait for all to complete and then clean up from the map
-      await Promise.all(
-        promiseEntries.map(([k, p]) => p.finally(() => this.timeoutProcessingPromises.delete(k))),
-      )
-    }
+      if (!this.currentBatchPerTopicPartition[key]) {
+        this.currentBatchPerTopicPartition[key] = []
+      }
 
-    // Accumulate the message
-    if (!this.currentBatchPerTopicPartition[key]) this.currentBatchPerTopicPartition[key] = []
-    this.currentBatchPerTopicPartition[key].push(message)
+      this.currentBatchPerTopicPartition[key].push(message)
 
-    // Check if the batch is complete by size
-    if (this.currentBatchPerTopicPartition[key].length >= this.batchSize) {
-      await this.flushCurrentBatchMessages(message.topic, message.partition)
-      callback()
+      if (this.currentBatchPerTopicPartition[key].length >= this.batchSize) {
+        await this.flushCurrentBatchMessages(message.topic, message.partition)
+      } else if (!this.batchTimeoutPerTopicPartition[key]) {
+        this.batchTimeoutPerTopicPartition[key] = setTimeout(() => {
+          void this.flushCurrentBatchMessages(message.topic, message.partition)
+        }, this.timeout)
+      }
+    } catch (error) {
+      callback(error as Error)
       return
-    }
-
-    // Start timeout for this partition if not already started
-    if (!this.batchTimeoutPerTopicPartition[key]) {
-      this.batchTimeoutPerTopicPartition[key] = setTimeout(
-        () =>
-          this.timeoutProcessingPromises.set(
-            key,
-            this.flushCurrentBatchMessages(message.topic, message.partition),
-          ),
-        this.timeout,
-      )
     }
 
     callback()
   }
 
   // Flush all remaining batches when stream is closing
-  override async _flush(callback: () => void) {
-    await this.flushAllBatches()
-    callback()
+  override async _flush(callback: (error?: Error | null | undefined) => void) {
+    try {
+      await this.flushAllBatches()
+      callback()
+    } catch (error) {
+      callback(error as Error)
+    }
   }
 
   private async flushAllBatches() {
-    for (const key of Object.keys(this.currentBatchPerTopicPartition)) {
+    const keys: string[] = Object.keys(this.currentBatchPerTopicPartition)
+
+    for (const key of keys) {
       const { topic, partition } = splitTopicPartitionKey(key)
       await this.flushCurrentBatchMessages(topic, partition)
     }
@@ -97,17 +92,23 @@ export class KafkaMessageBatchStream<
   private async flushCurrentBatchMessages(topic: string, partition: number) {
     const key = getTopicPartitionKey(topic, partition)
 
-    // Clear timeout
-    if (this.batchTimeoutPerTopicPartition[key]) {
-      clearTimeout(this.batchTimeoutPerTopicPartition[key])
+    const timeout = this.batchTimeoutPerTopicPartition[key]
+
+    if (timeout) {
+      clearTimeout(timeout)
       this.batchTimeoutPerTopicPartition[key] = undefined
     }
 
     const messages = this.currentBatchPerTopicPartition[key] ?? []
 
-    // Push the batch downstream
-    await this.onBatch({ topic, partition, messages })
-    this.currentBatchPerTopicPartition[key] = []
+    if (messages.length === 0) return
+
+    try {
+      // Push the batch downstream
+      await this.onBatch({ topic, partition, messages })
+    } finally {
+      this.currentBatchPerTopicPartition[key] = []
+    }
   }
 }
 
